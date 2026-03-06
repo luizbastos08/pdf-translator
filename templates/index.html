@@ -167,18 +167,30 @@
             background: linear-gradient(90deg, #7f5af0, #2cb5e8);
             border-radius: 3px;
             width: 0%;
-            animation: indeterminate 1.5s ease-in-out infinite;
+            transition: width 0.4s ease;
         }
 
-        @keyframes indeterminate {
-            0% { width: 0%; margin-left: 0%; }
-            50% { width: 60%; margin-left: 20%; }
-            100% { width: 0%; margin-left: 100%; }
+        .progress-info {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-top: 12px;
+        }
+
+        .progress-percentage {
+            color: #e0e0e0;
+            font-size: 0.9rem;
+            font-weight: 600;
+        }
+
+        .progress-eta {
+            color: #aaa;
+            font-size: 0.82rem;
         }
 
         .progress-text {
             text-align: center;
-            margin-top: 12px;
+            margin-top: 8px;
             color: #aaa;
             font-size: 0.85rem;
         }
@@ -252,9 +264,13 @@
 
         <div class="progress-container" id="progressContainer">
             <div class="progress-bar-bg">
-                <div class="progress-bar"></div>
+                <div class="progress-bar" id="progressBar"></div>
             </div>
-            <div class="progress-text">Traduzindo documento... Isso pode levar alguns minutos.</div>
+            <div class="progress-info">
+                <span class="progress-percentage" id="progressPercent">0%</span>
+                <span class="progress-eta" id="progressEta"></span>
+            </div>
+            <div class="progress-text" id="progressText">Traduzindo documento...</div>
         </div>
 
         <div class="error-msg" id="errorMsg"></div>
@@ -319,6 +335,39 @@
             }
         });
 
+        function formatEta(seconds) {
+            if (seconds < 0) return "calculando...";
+            if (seconds < 60) return `~${seconds}s restantes`;
+            const mins = Math.floor(seconds / 60);
+            const secs = seconds % 60;
+            if (mins < 60) return `~${mins}min ${secs}s restantes`;
+            const hours = Math.floor(mins / 60);
+            const remMins = mins % 60;
+            return `~${hours}h ${remMins}min restantes`;
+        }
+
+        function updateProgress(progress, etaSeconds) {
+            const bar = document.getElementById("progressBar");
+            const percent = document.getElementById("progressPercent");
+            const eta = document.getElementById("progressEta");
+
+            bar.style.width = progress + "%";
+            percent.textContent = progress + "%";
+            eta.textContent = formatEta(etaSeconds);
+        }
+
+        function resetProgress() {
+            const bar = document.getElementById("progressBar");
+            const percent = document.getElementById("progressPercent");
+            const eta = document.getElementById("progressEta");
+            const text = document.getElementById("progressText");
+
+            bar.style.width = "0%";
+            percent.textContent = "0%";
+            eta.textContent = "";
+            text.textContent = "Traduzindo documento...";
+        }
+
         // Form submit
         form.addEventListener("submit", async (e) => {
             e.preventDefault();
@@ -345,9 +394,11 @@
             formData.append("source_lang", document.getElementById("sourceLang").value);
 
             submitBtn.disabled = true;
+            resetProgress();
             progressContainer.style.display = "block";
 
             try {
+                // Step 1: Start the translation job
                 const response = await fetch("/api/translate", {
                     method: "POST",
                     body: formData,
@@ -358,11 +409,48 @@
                     throw new Error(err.error || "Erro desconhecido");
                 }
 
-                const blob = await response.blob();
+                const { job_id } = await response.json();
+
+                // Step 2: Listen for progress via SSE
+                await new Promise((resolve, reject) => {
+                    const evtSource = new EventSource(`/api/progress/${job_id}`);
+
+                    evtSource.onmessage = (event) => {
+                        const data = JSON.parse(event.data);
+
+                        if (data.error && data.status !== "done") {
+                            evtSource.close();
+                            reject(new Error(data.error));
+                            return;
+                        }
+
+                        updateProgress(data.progress, data.eta_seconds);
+
+                        if (data.status === "done") {
+                            evtSource.close();
+                            document.getElementById("progressText").textContent = "Traducao concluida! Baixando...";
+                            resolve(job_id);
+                        }
+                    };
+
+                    evtSource.onerror = () => {
+                        evtSource.close();
+                        reject(new Error("Conexao com o servidor perdida"));
+                    };
+                });
+
+                // Step 3: Download the translated file
+                const downloadResp = await fetch(`/api/download/${job_id}`);
+                if (!downloadResp.ok) {
+                    const err = await downloadResp.json();
+                    throw new Error(err.error || "Erro ao baixar arquivo");
+                }
+
+                const blob = await downloadResp.blob();
                 const url = URL.createObjectURL(blob);
                 const a = document.createElement("a");
                 a.href = url;
-                a.download = response.headers.get("Content-Disposition")
+                a.download = downloadResp.headers.get("Content-Disposition")
                     ?.split("filename=")[1]
                     ?.replace(/"/g, "") || "translated.pdf";
                 document.body.appendChild(a);
