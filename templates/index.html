@@ -1,0 +1,385 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PDF Translator</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, sans-serif;
+            background: linear-gradient(135deg, #0f0c29, #302b63, #24243e);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #e0e0e0;
+        }
+
+        .container {
+            background: rgba(255, 255, 255, 0.05);
+            backdrop-filter: blur(20px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 24px;
+            padding: 48px;
+            width: 100%;
+            max-width: 580px;
+            box-shadow: 0 25px 60px rgba(0, 0, 0, 0.4);
+        }
+
+        h1 {
+            text-align: center;
+            font-size: 2rem;
+            font-weight: 700;
+            margin-bottom: 8px;
+            background: linear-gradient(90deg, #7f5af0, #2cb5e8);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .subtitle {
+            text-align: center;
+            color: #999;
+            margin-bottom: 36px;
+            font-size: 0.95rem;
+        }
+
+        .form-group {
+            margin-bottom: 24px;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 500;
+            font-size: 0.9rem;
+            color: #ccc;
+        }
+
+        .file-drop-zone {
+            border: 2px dashed rgba(127, 90, 240, 0.4);
+            border-radius: 16px;
+            padding: 40px 20px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            background: rgba(127, 90, 240, 0.05);
+        }
+
+        .file-drop-zone:hover,
+        .file-drop-zone.dragover {
+            border-color: #7f5af0;
+            background: rgba(127, 90, 240, 0.12);
+        }
+
+        .file-drop-zone .icon {
+            font-size: 2.5rem;
+            margin-bottom: 12px;
+        }
+
+        .file-drop-zone .text {
+            color: #aaa;
+            font-size: 0.9rem;
+        }
+
+        .file-drop-zone .text strong {
+            color: #7f5af0;
+        }
+
+        .file-drop-zone .file-name {
+            margin-top: 12px;
+            color: #2cb5e8;
+            font-weight: 600;
+            font-size: 0.95rem;
+        }
+
+        select {
+            width: 100%;
+            padding: 12px 16px;
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            border-radius: 12px;
+            background: rgba(255, 255, 255, 0.07);
+            color: #e0e0e0;
+            font-size: 0.95rem;
+            appearance: none;
+            -webkit-appearance: none;
+            cursor: pointer;
+            outline: none;
+            transition: border-color 0.3s;
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23999' stroke-width='2'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+            background-repeat: no-repeat;
+            background-position: right 16px center;
+        }
+
+        select:focus {
+            border-color: #7f5af0;
+        }
+
+        select option {
+            background: #1a1a2e;
+            color: #e0e0e0;
+        }
+
+        .btn {
+            width: 100%;
+            padding: 14px;
+            border: none;
+            border-radius: 12px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            background: linear-gradient(135deg, #7f5af0, #2cb5e8);
+            color: white;
+            letter-spacing: 0.5px;
+        }
+
+        .btn:hover:not(:disabled) {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 25px rgba(127, 90, 240, 0.4);
+        }
+
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .progress-container {
+            display: none;
+            margin-top: 24px;
+        }
+
+        .progress-bar-bg {
+            width: 100%;
+            height: 6px;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 3px;
+            overflow: hidden;
+        }
+
+        .progress-bar {
+            height: 100%;
+            background: linear-gradient(90deg, #7f5af0, #2cb5e8);
+            border-radius: 3px;
+            width: 0%;
+            animation: indeterminate 1.5s ease-in-out infinite;
+        }
+
+        @keyframes indeterminate {
+            0% { width: 0%; margin-left: 0%; }
+            50% { width: 60%; margin-left: 20%; }
+            100% { width: 0%; margin-left: 100%; }
+        }
+
+        .progress-text {
+            text-align: center;
+            margin-top: 12px;
+            color: #aaa;
+            font-size: 0.85rem;
+        }
+
+        .error-msg {
+            margin-top: 16px;
+            padding: 12px 16px;
+            background: rgba(255, 59, 48, 0.15);
+            border: 1px solid rgba(255, 59, 48, 0.3);
+            border-radius: 12px;
+            color: #ff6b6b;
+            font-size: 0.9rem;
+            display: none;
+        }
+
+        .success-msg {
+            margin-top: 16px;
+            padding: 12px 16px;
+            background: rgba(52, 199, 89, 0.15);
+            border: 1px solid rgba(52, 199, 89, 0.3);
+            border-radius: 12px;
+            color: #34c759;
+            font-size: 0.9rem;
+            display: none;
+        }
+
+        .optional-tag {
+            font-size: 0.75rem;
+            color: #888;
+            font-weight: 400;
+            margin-left: 6px;
+        }
+
+        input[type="file"] {
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>PDF Translator</h1>
+        <p class="subtitle">Traduza documentos PDF preservando a formatacao original</p>
+
+        <form id="translateForm">
+            <div class="form-group">
+                <label>Documento PDF</label>
+                <div class="file-drop-zone" id="dropZone">
+                    <div class="icon">&#128196;</div>
+                    <div class="text">Arraste seu PDF aqui ou <strong>clique para selecionar</strong></div>
+                    <div class="file-name" id="fileName"></div>
+                </div>
+                <input type="file" id="fileInput" accept=".pdf">
+            </div>
+
+            <div class="form-group">
+                <label>Idioma de origem <span class="optional-tag">(opcional - detecta automaticamente)</span></label>
+                <select id="sourceLang">
+                    <option value="auto">Detectar automaticamente</option>
+                </select>
+            </div>
+
+            <div class="form-group">
+                <label>Idioma de destino</label>
+                <select id="targetLang" required>
+                    <option value="">Selecione o idioma</option>
+                </select>
+            </div>
+
+            <button type="submit" class="btn" id="submitBtn">Traduzir PDF</button>
+        </form>
+
+        <div class="progress-container" id="progressContainer">
+            <div class="progress-bar-bg">
+                <div class="progress-bar"></div>
+            </div>
+            <div class="progress-text">Traduzindo documento... Isso pode levar alguns minutos.</div>
+        </div>
+
+        <div class="error-msg" id="errorMsg"></div>
+        <div class="success-msg" id="successMsg"></div>
+    </div>
+
+    <script>
+        const dropZone = document.getElementById("dropZone");
+        const fileInput = document.getElementById("fileInput");
+        const fileName = document.getElementById("fileName");
+        const form = document.getElementById("translateForm");
+        const submitBtn = document.getElementById("submitBtn");
+        const progressContainer = document.getElementById("progressContainer");
+        const errorMsg = document.getElementById("errorMsg");
+        const successMsg = document.getElementById("successMsg");
+
+        // Load languages
+        fetch("/api/languages")
+            .then(res => res.json())
+            .then(languages => {
+                const sourceSel = document.getElementById("sourceLang");
+                const targetSel = document.getElementById("targetLang");
+
+                const sorted = Object.entries(languages).sort((a, b) => a[0].localeCompare(b[0]));
+
+                sorted.forEach(([name, code]) => {
+                    const opt1 = new Option(name.charAt(0).toUpperCase() + name.slice(1), code);
+                    const opt2 = new Option(name.charAt(0).toUpperCase() + name.slice(1), code);
+                    sourceSel.appendChild(opt1);
+                    targetSel.appendChild(opt2);
+                });
+
+                // Default target to Portuguese
+                targetSel.value = "pt";
+            });
+
+        // File drop zone
+        dropZone.addEventListener("click", () => fileInput.click());
+
+        dropZone.addEventListener("dragover", (e) => {
+            e.preventDefault();
+            dropZone.classList.add("dragover");
+        });
+
+        dropZone.addEventListener("dragleave", () => {
+            dropZone.classList.remove("dragover");
+        });
+
+        dropZone.addEventListener("drop", (e) => {
+            e.preventDefault();
+            dropZone.classList.remove("dragover");
+            const files = e.dataTransfer.files;
+            if (files.length > 0 && files[0].name.toLowerCase().endsWith(".pdf")) {
+                fileInput.files = files;
+                fileName.textContent = files[0].name;
+            }
+        });
+
+        fileInput.addEventListener("change", () => {
+            if (fileInput.files.length > 0) {
+                fileName.textContent = fileInput.files[0].name;
+            }
+        });
+
+        // Form submit
+        form.addEventListener("submit", async (e) => {
+            e.preventDefault();
+
+            errorMsg.style.display = "none";
+            successMsg.style.display = "none";
+
+            if (!fileInput.files.length) {
+                errorMsg.textContent = "Selecione um arquivo PDF.";
+                errorMsg.style.display = "block";
+                return;
+            }
+
+            const targetLang = document.getElementById("targetLang").value;
+            if (!targetLang) {
+                errorMsg.textContent = "Selecione o idioma de destino.";
+                errorMsg.style.display = "block";
+                return;
+            }
+
+            const formData = new FormData();
+            formData.append("file", fileInput.files[0]);
+            formData.append("target_lang", targetLang);
+            formData.append("source_lang", document.getElementById("sourceLang").value);
+
+            submitBtn.disabled = true;
+            progressContainer.style.display = "block";
+
+            try {
+                const response = await fetch("/api/translate", {
+                    method: "POST",
+                    body: formData,
+                });
+
+                if (!response.ok) {
+                    const err = await response.json();
+                    throw new Error(err.error || "Erro desconhecido");
+                }
+
+                const blob = await response.blob();
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement("a");
+                a.href = url;
+                a.download = response.headers.get("Content-Disposition")
+                    ?.split("filename=")[1]
+                    ?.replace(/"/g, "") || "translated.pdf";
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+                URL.revokeObjectURL(url);
+
+                successMsg.textContent = "Traducao concluida! O download foi iniciado.";
+                successMsg.style.display = "block";
+            } catch (err) {
+                errorMsg.textContent = err.message;
+                errorMsg.style.display = "block";
+            } finally {
+                submitBtn.disabled = false;
+                progressContainer.style.display = "none";
+            }
+        });
+    </script>
+</body>
+</html>
