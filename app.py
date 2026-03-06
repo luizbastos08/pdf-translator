@@ -115,42 +115,90 @@ def docx_to_pdf(docx_path: str, pdf_path: str):
         os.rename(lo_output, pdf_path)
 
 
+def _clear_run_text(run):
+    """Clear all text from a run at the XML level, preserving formatting."""
+    for t in run._element.findall(qn('w:t')):
+        t.text = ''
+
+
+def _set_run_text(run, text):
+    """Set text on a run at the XML level, preserving all formatting."""
+    r_elem = run._element
+    t_elems = r_elem.findall(qn('w:t'))
+    if t_elems:
+        t_elems[0].text = text
+        t_elems[0].set(qn('xml:space'), 'preserve')
+        for t in t_elems[1:]:
+            r_elem.remove(t)
+    else:
+        t = OxmlElement('w:t')
+        t.text = text
+        t.set(qn('xml:space'), 'preserve')
+        r_elem.append(t)
+
+
+def _dedup_runs(paragraph):
+    """Remove consecutive duplicate runs within a paragraph (pdf2docx artifact).
+
+    Returns the deduplicated runs that have text.
+    """
+    runs = paragraph.runs
+    kept = []
+    prev_text = None
+    for run in runs:
+        text = run.text.strip()
+        if not text:
+            continue
+        if text == prev_text:
+            _clear_run_text(run)
+            continue
+        prev_text = text
+        kept.append(run)
+    return kept
+
+
 def translate_docx(docx_path: str, source_lang: str, target_lang: str, job_id: str = None):
     """Translate all text in a DOCX file while preserving formatting."""
     doc = Document(docx_path)
 
-    # Collect all translatable text runs from paragraphs and tables
-    all_runs = []  # (run_object, original_text)
+    # Collect all paragraphs from every part of the document
+    all_paragraphs = []
 
-    # From paragraphs
-    for paragraph in doc.paragraphs:
-        for run in paragraph.runs:
-            text = run.text.strip()
-            if text:
-                all_runs.append((run, run.text))
+    for para in doc.paragraphs:
+        all_paragraphs.append(para)
 
-    # From tables
     for table in doc.tables:
         for row in table.rows:
             for cell in row.cells:
-                for paragraph in cell.paragraphs:
-                    for run in paragraph.runs:
-                        text = run.text.strip()
-                        if text:
-                            all_runs.append((run, run.text))
+                for para in cell.paragraphs:
+                    all_paragraphs.append(para)
 
-    # From headers and footers
     for section in doc.sections:
-        for header_footer in [section.header, section.footer]:
-            if header_footer is not None:
-                for paragraph in header_footer.paragraphs:
-                    for run in paragraph.runs:
-                        text = run.text.strip()
-                        if text:
-                            all_runs.append((run, run.text))
+        for hf in [section.header, section.footer]:
+            if hf is not None:
+                for para in hf.paragraphs:
+                    all_paragraphs.append(para)
 
-    total_runs = len(all_runs)
-    if total_runs == 0:
+    # Phase 1: Deduplicate consecutive paragraphs with identical text
+    # and deduplicate runs within each paragraph (pdf2docx artifacts)
+    deduped = []
+    prev_text = None
+    for para in all_paragraphs:
+        text = para.text.strip()
+        if not text:
+            continue
+        if text == prev_text:
+            # Clear all text in this duplicate paragraph
+            for run in para.runs:
+                _clear_run_text(run)
+            continue
+        prev_text = text
+        # Also deduplicate runs within the paragraph
+        _dedup_runs(para)
+        deduped.append(para)
+
+    total = len(deduped)
+    if total == 0:
         doc.save(docx_path)
         return
 
@@ -158,49 +206,50 @@ def translate_docx(docx_path: str, source_lang: str, target_lang: str, job_id: s
         translation_jobs[job_id]["progress"] = 10
         translation_jobs[job_id]["status"] = "translating"
 
-    # Translate in chunks to show progress
+    # Phase 2: Translate paragraph by paragraph (full context)
     chunk_size = 50
     start_time = time.time()
 
-    for chunk_start in range(0, total_runs, chunk_size):
-        chunk_end = min(chunk_start + chunk_size, total_runs)
-        chunk_runs = all_runs[chunk_start:chunk_end]
-        chunk_texts = [text for _, text in chunk_runs]
+    for chunk_start in range(0, total, chunk_size):
+        chunk_end = min(chunk_start + chunk_size, total)
+        chunk_paras = deduped[chunk_start:chunk_end]
+        chunk_texts = [p.text for p in chunk_paras]
 
         translated = translate_texts(chunk_texts, source_lang, target_lang)
 
-        for (run, original_text), new_text in zip(chunk_runs, translated):
-            if new_text and new_text != original_text:
-                # Preserve leading/trailing whitespace from original
-                leading = len(original_text) - len(original_text.lstrip())
-                trailing = len(original_text) - len(original_text.rstrip())
-                prefix = original_text[:leading] if leading else ""
-                suffix = original_text[-trailing:] if trailing else ""
-                final_text = prefix + new_text.strip() + suffix
+        for para, new_text in zip(chunk_paras, translated):
+            orig_text = para.text
+            if not new_text or new_text == orig_text:
+                continue
 
-                # Replace text directly in XML to avoid python-docx
-                # clear_content() which can strip formatting elements
-                r_elem = run._element
-                t_elems = r_elem.findall(qn('w:t'))
-                if t_elems:
-                    t_elems[0].text = final_text
-                    t_elems[0].set(qn('xml:space'), 'preserve')
-                    for t in t_elems[1:]:
-                        r_elem.remove(t)
-                else:
-                    t = OxmlElement('w:t')
-                    t.text = final_text
-                    t.set(qn('xml:space'), 'preserve')
-                    r_elem.append(t)
+            runs_with_text = [r for r in para.runs if r.text]
+            if not runs_with_text:
+                continue
+
+            if len(runs_with_text) == 1:
+                # Single run: replace its text, preserving whitespace
+                orig = runs_with_text[0].text
+                leading = len(orig) - len(orig.lstrip())
+                trailing = len(orig) - len(orig.rstrip())
+                prefix = orig[:leading] if leading else ""
+                suffix = orig[-trailing:] if trailing else ""
+                _set_run_text(runs_with_text[0], prefix + new_text.strip() + suffix)
+            else:
+                # Multiple runs: assign translated text to first run,
+                # clear the rest. This preserves the first run's formatting
+                # and avoids fragmented/duplicated translation.
+                _set_run_text(runs_with_text[0], new_text)
+                for run in runs_with_text[1:]:
+                    _clear_run_text(run)
 
         if job_id:
-            progress = 10 + int((chunk_end / total_runs) * 70)
+            progress = 10 + int((chunk_end / total) * 70)
             translation_jobs[job_id]["progress"] = progress
             elapsed = time.time() - start_time
             if chunk_end > 0 and elapsed > 0:
                 rate = chunk_end / elapsed
-                remaining = (total_runs - chunk_end) / rate
-                translation_jobs[job_id]["eta_seconds"] = max(0, int(remaining + 15))  # +15s for PDF conversion
+                remaining = (total - chunk_end) / rate
+                translation_jobs[job_id]["eta_seconds"] = max(0, int(remaining + 15))
 
     doc.save(docx_path)
 
