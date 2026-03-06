@@ -12,8 +12,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, request, send_file, jsonify, render_template, Response
 from deep_translator import GoogleTranslator
 from werkzeug.utils import secure_filename
+from copy import deepcopy
 from pdf2docx import Converter
 from docx import Document
+from docx.oxml.ns import qn
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB max
@@ -174,7 +176,20 @@ def translate_docx(docx_path: str, source_lang: str, target_lang: str, job_id: s
                 trailing = len(original_text) - len(original_text.rstrip())
                 prefix = original_text[:leading] if leading else ""
                 suffix = original_text[-trailing:] if trailing else ""
+
+                # Save the formatting XML before modifying text
+                rPr = run._element.find(qn('w:rPr'))
+                rPr_copy = deepcopy(rPr) if rPr is not None else None
+
                 run.text = prefix + new_text.strip() + suffix
+
+                # Restore formatting XML to preserve font, size, color, etc.
+                if rPr_copy is not None:
+                    existing_rPr = run._element.find(qn('w:rPr'))
+                    if existing_rPr is not None:
+                        run._element.replace(existing_rPr, rPr_copy)
+                    else:
+                        run._element.insert(0, rPr_copy)
 
         if job_id:
             progress = 10 + int((chunk_end / total_runs) * 70)
