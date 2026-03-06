@@ -3,12 +3,15 @@ import uuid
 import time
 import threading
 import json
+import subprocess
+import tempfile
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import fitz  # PyMuPDF
 from flask import Flask, request, send_file, jsonify, render_template, Response
 from deep_translator import GoogleTranslator
 from werkzeug.utils import secure_filename
+from pdf2docx import Converter
+from docx import Document
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB max
@@ -20,204 +23,175 @@ os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
 SUPPORTED_LANGUAGES = GoogleTranslator().get_supported_languages(as_dict=True)
 
-# Store translation job progress: {job_id: {"progress": 0-100, "status": str, "error": str|None, "output_path": str, "output_filename": str}}
+# Store translation job progress
 translation_jobs = {}
 
-
-def detect_language(text: str) -> str:
-    """Detect language using Google Translate auto-detection."""
-    try:
-        detected = GoogleTranslator(source="auto", target="en").translate(text[:200])
-        # We use 'auto' source in translation, so detection is implicit
-        return "auto"
-    except Exception:
-        return "auto"
-
-
-BATCH_SEPARATOR = " \n|~|~|~|\n "
 MAX_CHUNK = 4500
 MAX_WORKERS = 4
 
 
-def translate_batch(texts: list[str], source: str, target: str) -> list[str]:
-    """Translate multiple texts in as few API calls as possible by batching with a separator."""
+def translate_texts(texts: list[str], source: str, target: str) -> list[str]:
+    """Translate a list of texts, batching where possible but falling back to individual translation."""
     if not texts:
         return []
 
     translator = GoogleTranslator(source=source, target=target)
+    results = [""] * len(texts)
 
-    # Group texts into batches that fit within the API char limit
-    batches = []  # list of (joined_text, count)
-    current_texts = []
-    current_len = 0
-
-    for text in texts:
-        added_len = len(text) + (len(BATCH_SEPARATOR) if current_texts else 0)
-        if current_len + added_len > MAX_CHUNK and current_texts:
-            batches.append((BATCH_SEPARATOR.join(current_texts), len(current_texts)))
-            current_texts = []
-            current_len = 0
-        current_texts.append(text)
-        current_len += added_len
-
-    if current_texts:
-        batches.append((BATCH_SEPARATOR.join(current_texts), len(current_texts)))
-
-    # Translate batches in parallel
-    results = [None] * len(batches)
-
-    def translate_one_batch(idx, batch_text, count):
+    # Try to translate individually for reliability - batch caused too many issues
+    # with separator mangling. Use threading for speed.
+    def translate_one(idx, text):
         try:
-            result = translator.translate(batch_text)
-            if result:
-                parts = result.split(BATCH_SEPARATOR.strip())
-                # Clean up whitespace from split
-                parts = [p.strip() for p in parts]
-                if len(parts) == count:
-                    return idx, parts
-                # Fallback: if separator was mangled, return as single block
-                return idx, [result] + [""] * (count - 1)
-            return idx, None
+            result = translator.translate(text)
+            return idx, result if result else text
         except Exception:
-            return idx, None
+            return idx, text
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = [
-            executor.submit(translate_one_batch, i, batch_text, count)
-            for i, (batch_text, count) in enumerate(batches)
+            executor.submit(translate_one, i, text)
+            for i, text in enumerate(texts)
         ]
         for future in as_completed(futures):
-            idx, parts = future.result()
-            results[idx] = parts
+            idx, translated = future.result()
+            results[idx] = translated
 
-    # Flatten results back to a list matching input order
-    translated = []
-    text_idx = 0
-    for i, (_, count) in enumerate(batches):
-        parts = results[i]
-        for j in range(count):
-            original = texts[text_idx]
-            if parts and j < len(parts) and parts[j]:
-                translated.append(parts[j])
-            else:
-                translated.append(original)
-            text_idx += 1
-
-    return translated
+    return results
 
 
-def get_pdf_font(font_name: str) -> str:
-    """Map font name to a PDF base font."""
-    name_lower = font_name.lower()
-    if "bold" in name_lower and "italic" in name_lower:
-        return "hebi"
-    elif "bold" in name_lower:
-        return "hebo"
-    elif "italic" in name_lower:
-        return "heit"
-    return "helv"
+def pdf_to_docx(pdf_path: str, docx_path: str):
+    """Convert PDF to DOCX using pdf2docx."""
+    cv = Converter(pdf_path)
+    cv.convert(docx_path)
+    cv.close()
+
+
+def docx_to_pdf(docx_path: str, pdf_path: str):
+    """Convert DOCX to PDF using LibreOffice."""
+    output_dir = os.path.dirname(pdf_path)
+    result = subprocess.run(
+        [
+            "libreoffice",
+            "--headless",
+            "--convert-to", "pdf",
+            "--outdir", output_dir,
+            docx_path,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"LibreOffice conversion failed: {result.stderr}")
+
+    # LibreOffice outputs with the same basename but .pdf extension
+    lo_output = os.path.join(
+        output_dir,
+        os.path.splitext(os.path.basename(docx_path))[0] + ".pdf"
+    )
+    if lo_output != pdf_path:
+        os.rename(lo_output, pdf_path)
+
+
+def translate_docx(docx_path: str, source_lang: str, target_lang: str, job_id: str = None):
+    """Translate all text in a DOCX file while preserving formatting."""
+    doc = Document(docx_path)
+
+    # Collect all translatable text runs from paragraphs and tables
+    all_runs = []  # (run_object, original_text)
+
+    # From paragraphs
+    for paragraph in doc.paragraphs:
+        for run in paragraph.runs:
+            text = run.text.strip()
+            if text:
+                all_runs.append((run, run.text))
+
+    # From tables
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for paragraph in cell.paragraphs:
+                    for run in paragraph.runs:
+                        text = run.text.strip()
+                        if text:
+                            all_runs.append((run, run.text))
+
+    # From headers and footers
+    for section in doc.sections:
+        for header_footer in [section.header, section.footer]:
+            if header_footer is not None:
+                for paragraph in header_footer.paragraphs:
+                    for run in paragraph.runs:
+                        text = run.text.strip()
+                        if text:
+                            all_runs.append((run, run.text))
+
+    total_runs = len(all_runs)
+    if total_runs == 0:
+        doc.save(docx_path)
+        return
+
+    if job_id:
+        translation_jobs[job_id]["progress"] = 10
+        translation_jobs[job_id]["status"] = "translating"
+
+    # Translate in chunks to show progress
+    chunk_size = 50
+    start_time = time.time()
+
+    for chunk_start in range(0, total_runs, chunk_size):
+        chunk_end = min(chunk_start + chunk_size, total_runs)
+        chunk_runs = all_runs[chunk_start:chunk_end]
+        chunk_texts = [text for _, text in chunk_runs]
+
+        translated = translate_texts(chunk_texts, source_lang, target_lang)
+
+        for (run, original_text), new_text in zip(chunk_runs, translated):
+            if new_text and new_text != original_text:
+                # Preserve leading/trailing whitespace from original
+                leading = len(original_text) - len(original_text.lstrip())
+                trailing = len(original_text) - len(original_text.rstrip())
+                prefix = original_text[:leading] if leading else ""
+                suffix = original_text[-trailing:] if trailing else ""
+                run.text = prefix + new_text.strip() + suffix
+
+        if job_id:
+            progress = 10 + int((chunk_end / total_runs) * 70)
+            translation_jobs[job_id]["progress"] = progress
+            elapsed = time.time() - start_time
+            if chunk_end > 0 and elapsed > 0:
+                rate = chunk_end / elapsed
+                remaining = (total_runs - chunk_end) / rate
+                translation_jobs[job_id]["eta_seconds"] = max(0, int(remaining + 15))  # +15s for PDF conversion
+
+    doc.save(docx_path)
 
 
 def translate_pdf(input_path: str, output_path: str, source_lang: str, target_lang: str, job_id: str = None):
-    """Translate a PDF preserving formatting, images, and layout."""
-    doc = fitz.open(input_path)
+    """Translate a PDF: PDF -> DOCX -> translate -> PDF."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        docx_path = os.path.join(tmp_dir, "document.docx")
 
-    # Phase 1: Extract all translatable spans from all pages
-    all_spans = []  # list of (page_num, span_info_dict)
-    for page_num in range(len(doc)):
-        page = doc[page_num]
-        blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)["blocks"]
-        for block in blocks:
-            if block["type"] != 0:
-                continue
-            for line in block["lines"]:
-                for span in line["spans"]:
-                    if span["text"].strip():
-                        all_spans.append((page_num, span))
+        # Step 1: PDF -> DOCX
+        if job_id:
+            translation_jobs[job_id]["progress"] = 2
+            translation_jobs[job_id]["status"] = "converting"
 
-    total_spans = len(all_spans)
-    if total_spans == 0:
-        doc.save(output_path, garbage=4, deflate=True)
-        doc.close()
-        return
+        pdf_to_docx(input_path, docx_path)
 
-    # Phase 2: Batch translate all texts at once
-    all_texts = [span["text"] for _, span in all_spans]
+        if job_id:
+            translation_jobs[job_id]["progress"] = 10
 
-    if job_id:
-        translation_jobs[job_id]["progress"] = 5
-        translation_jobs[job_id]["eta_seconds"] = -1
+        # Step 2: Translate DOCX content
+        translate_docx(docx_path, source_lang, target_lang, job_id)
 
-    start_time = time.time()
-    translated_texts = translate_batch(all_texts, source_lang, target_lang)
+        if job_id:
+            translation_jobs[job_id]["progress"] = 85
+            translation_jobs[job_id]["status"] = "generating_pdf"
 
-    if job_id:
-        translation_jobs[job_id]["progress"] = 70
-
-    # Phase 3: Apply changes to PDF (redact + insert) page by page
-    # Group spans by page for batch redaction
-    page_changes = defaultdict(list)
-
-    for i, ((page_num, span), translated_text) in enumerate(zip(all_spans, translated_texts)):
-        original_text = span["text"]
-        if translated_text and translated_text != original_text:
-            page_changes[page_num].append((span, translated_text))
-
-    pages_done = 0
-    total_pages_with_changes = len(page_changes)
-
-    for page_num, changes in page_changes.items():
-        page = doc[page_num]
-
-        # Batch: add all redact annotations first
-        for span, _ in changes:
-            rect = fitz.Rect(span["bbox"])
-            annot = page.add_redact_annot(rect)
-            annot.set_colors(fill=(1, 1, 1))
-
-        # Apply all redactions at once (much faster than per-span)
-        page.apply_redactions()
-
-        # Insert all translated texts
-        for span, translated_text in changes:
-            rect = fitz.Rect(span["bbox"])
-            font_size = span["size"]
-            font_color = span["color"]
-            pdf_font = get_pdf_font(span["font"])
-
-            r = ((font_color >> 16) & 0xFF) / 255.0
-            g = ((font_color >> 8) & 0xFF) / 255.0
-            b = (font_color & 0xFF) / 255.0
-
-            text_width = fitz.get_text_length(translated_text, fontname=pdf_font, fontsize=font_size)
-            available_width = rect.width
-
-            if text_width > 0 and available_width > 0:
-                adjusted_size = min(font_size, font_size * (available_width / text_width))
-                adjusted_size = max(adjusted_size, font_size * 0.5)
-            else:
-                adjusted_size = font_size
-
-            text_point = fitz.Point(rect.x0, rect.y1 - (rect.height - adjusted_size) / 2)
-            page.insert_text(
-                text_point,
-                translated_text,
-                fontname=pdf_font,
-                fontsize=adjusted_size,
-                color=(r, g, b),
-            )
-
-        pages_done += 1
-        if job_id and total_pages_with_changes > 0:
-            pdf_progress = int((pages_done / total_pages_with_changes) * 30)
-            translation_jobs[job_id]["progress"] = 70 + pdf_progress
-            elapsed = time.time() - start_time
-            if elapsed > 0:
-                total_estimated = elapsed / (0.7 + pdf_progress / 100)
-                translation_jobs[job_id]["eta_seconds"] = max(0, int(total_estimated - elapsed))
-
-    doc.save(output_path, garbage=4, deflate=True)
-    doc.close()
+        # Step 3: DOCX -> PDF
+        docx_to_pdf(docx_path, output_path)
 
 
 @app.route("/")
@@ -243,7 +217,6 @@ def run_translation_job(job_id, input_path, output_path, output_filename, source
         translation_jobs[job_id]["status"] = "error"
         translation_jobs[job_id]["error"] = str(e)
     finally:
-        # Clean up input file
         if os.path.exists(input_path):
             os.remove(input_path)
 
@@ -268,7 +241,6 @@ def translate():
     if not source_lang:
         source_lang = "auto"
 
-    # Save uploaded file
     job_id = str(uuid.uuid4())
     filename = secure_filename(file.filename)
     input_path = os.path.join(UPLOAD_FOLDER, f"{job_id}_{filename}")
@@ -277,17 +249,15 @@ def translate():
 
     file.save(input_path)
 
-    # Initialize job tracking
     translation_jobs[job_id] = {
         "progress": 0,
         "eta_seconds": -1,
-        "status": "translating",
+        "status": "starting",
         "error": None,
         "output_path": output_path,
         "output_filename": output_filename,
     }
 
-    # Start translation in background thread
     thread = threading.Thread(
         target=run_translation_job,
         args=(job_id, input_path, output_path, output_filename, source_lang, target_lang),
@@ -310,14 +280,13 @@ def progress(job_id):
 
             data = {
                 "progress": job["progress"],
-                "eta_seconds": job["eta_seconds"],
+                "eta_seconds": job.get("eta_seconds", -1),
                 "status": job["status"],
             }
 
             if job["status"] == "error":
                 data["error"] = job["error"]
                 yield f"data: {jsonify_str(data)}\n\n"
-                # Clean up job
                 translation_jobs.pop(job_id, None)
                 break
 
@@ -355,7 +324,6 @@ def download(job_id):
     if not os.path.exists(output_path):
         return jsonify({"error": "Arquivo traduzido nao encontrado"}), 404
 
-    # Clean up job after sending file
     def cleanup():
         translation_jobs.pop(job_id, None)
         if os.path.exists(output_path):
@@ -368,7 +336,6 @@ def download(job_id):
         mimetype="application/pdf",
     )
 
-    # Schedule cleanup after response
     response.call_on_close(cleanup)
     return response
 

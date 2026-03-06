@@ -346,14 +346,26 @@
             return `~${hours}h ${remMins}min restantes`;
         }
 
-        function updateProgress(progress, etaSeconds) {
+        const statusMessages = {
+            "starting": "Iniciando...",
+            "converting": "Convertendo PDF para formato editavel...",
+            "translating": "Traduzindo documento...",
+            "generating_pdf": "Gerando PDF final...",
+            "done": "Traducao concluida!",
+        };
+
+        function updateProgress(progress, etaSeconds, status) {
             const bar = document.getElementById("progressBar");
             const percent = document.getElementById("progressPercent");
             const eta = document.getElementById("progressEta");
+            const text = document.getElementById("progressText");
 
             bar.style.width = progress + "%";
             percent.textContent = progress + "%";
             eta.textContent = formatEta(etaSeconds);
+            if (status && statusMessages[status]) {
+                text.textContent = statusMessages[status];
+            }
         }
 
         function resetProgress() {
@@ -424,7 +436,7 @@
                             return;
                         }
 
-                        updateProgress(data.progress, data.eta_seconds);
+                        updateProgress(data.progress, data.eta_seconds, data.status);
 
                         if (data.status === "done") {
                             evtSource.close();
