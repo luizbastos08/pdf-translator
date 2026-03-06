@@ -4,6 +4,8 @@ import time
 import threading
 import json
 import subprocess
+import shutil
+import sys
 import tempfile
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -66,12 +68,30 @@ def pdf_to_docx(pdf_path: str, docx_path: str):
     cv.close()
 
 
+def _find_libreoffice() -> str:
+    """Find the LibreOffice executable across platforms."""
+    for name in ("libreoffice", "soffice"):
+        path = shutil.which(name)
+        if path:
+            return path
+    if sys.platform == "win32":
+        for prog_dir in (os.environ.get("PROGRAMFILES", ""), os.environ.get("PROGRAMFILES(X86)", "")):
+            if prog_dir:
+                candidate = os.path.join(prog_dir, "LibreOffice", "program", "soffice.exe")
+                if os.path.isfile(candidate):
+                    return candidate
+    raise FileNotFoundError(
+        "LibreOffice not found. Install it and make sure 'soffice' is in your PATH."
+    )
+
+
 def docx_to_pdf(docx_path: str, pdf_path: str):
     """Convert DOCX to PDF using LibreOffice."""
+    lo_bin = _find_libreoffice()
     output_dir = os.path.dirname(pdf_path)
     result = subprocess.run(
         [
-            "libreoffice",
+            lo_bin,
             "--headless",
             "--convert-to", "pdf",
             "--outdir", output_dir,
