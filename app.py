@@ -2,6 +2,9 @@ import os
 import uuid
 import time
 import threading
+import json
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import fitz  # PyMuPDF
 from flask import Flask, request, send_file, jsonify, render_template, Response
 from deep_translator import GoogleTranslator
@@ -31,63 +34,96 @@ def detect_language(text: str) -> str:
         return "auto"
 
 
-def translate_text_chunked(text: str, source: str, target: str) -> str:
-    """Translate text, splitting into chunks if needed (Google Translate has a 5000 char limit)."""
-    if not text or not text.strip():
-        return text
+BATCH_SEPARATOR = " \n|~|~|~|\n "
+MAX_CHUNK = 4500
+MAX_WORKERS = 4
 
-    max_chunk = 4500
+
+def translate_batch(texts: list[str], source: str, target: str) -> list[str]:
+    """Translate multiple texts in as few API calls as possible by batching with a separator."""
+    if not texts:
+        return []
+
     translator = GoogleTranslator(source=source, target=target)
 
-    if len(text) <= max_chunk:
+    # Group texts into batches that fit within the API char limit
+    batches = []  # list of (joined_text, count)
+    current_texts = []
+    current_len = 0
+
+    for text in texts:
+        added_len = len(text) + (len(BATCH_SEPARATOR) if current_texts else 0)
+        if current_len + added_len > MAX_CHUNK and current_texts:
+            batches.append((BATCH_SEPARATOR.join(current_texts), len(current_texts)))
+            current_texts = []
+            current_len = 0
+        current_texts.append(text)
+        current_len += added_len
+
+    if current_texts:
+        batches.append((BATCH_SEPARATOR.join(current_texts), len(current_texts)))
+
+    # Translate batches in parallel
+    results = [None] * len(batches)
+
+    def translate_one_batch(idx, batch_text, count):
         try:
-            result = translator.translate(text)
-            return result if result else text
+            result = translator.translate(batch_text)
+            if result:
+                parts = result.split(BATCH_SEPARATOR.strip())
+                # Clean up whitespace from split
+                parts = [p.strip() for p in parts]
+                if len(parts) == count:
+                    return idx, parts
+                # Fallback: if separator was mangled, return as single block
+                return idx, [result] + [""] * (count - 1)
+            return idx, None
         except Exception:
-            return text
+            return idx, None
 
-    # Split by sentences/newlines for longer texts
-    chunks = []
-    current_chunk = ""
-    sentences = text.replace("\n", "\n\x00").split("\x00")
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = [
+            executor.submit(translate_one_batch, i, batch_text, count)
+            for i, (batch_text, count) in enumerate(batches)
+        ]
+        for future in as_completed(futures):
+            idx, parts = future.result()
+            results[idx] = parts
 
-    for sentence in sentences:
-        if len(current_chunk) + len(sentence) <= max_chunk:
-            current_chunk += sentence
-        else:
-            if current_chunk:
-                chunks.append(current_chunk)
-            # If a single sentence is too long, split by words
-            if len(sentence) > max_chunk:
-                words = sentence.split(" ")
-                current_chunk = ""
-                for word in words:
-                    if len(current_chunk) + len(word) + 1 <= max_chunk:
-                        current_chunk += (" " if current_chunk else "") + word
-                    else:
-                        if current_chunk:
-                            chunks.append(current_chunk)
-                        current_chunk = word
+    # Flatten results back to a list matching input order
+    translated = []
+    text_idx = 0
+    for i, (_, count) in enumerate(batches):
+        parts = results[i]
+        for j in range(count):
+            original = texts[text_idx]
+            if parts and j < len(parts) and parts[j]:
+                translated.append(parts[j])
             else:
-                current_chunk = sentence
+                translated.append(original)
+            text_idx += 1
 
-    if current_chunk:
-        chunks.append(current_chunk)
-
-    translated_parts = []
-    for chunk in chunks:
-        try:
-            result = translator.translate(chunk)
-            translated_parts.append(result if result else chunk)
-        except Exception:
-            translated_parts.append(chunk)
-
-    return "".join(translated_parts)
+    return translated
 
 
-def count_translatable_spans(doc):
-    """Count total translatable spans in the document for progress tracking."""
-    total = 0
+def get_pdf_font(font_name: str) -> str:
+    """Map font name to a PDF base font."""
+    name_lower = font_name.lower()
+    if "bold" in name_lower and "italic" in name_lower:
+        return "hebi"
+    elif "bold" in name_lower:
+        return "hebo"
+    elif "italic" in name_lower:
+        return "heit"
+    return "helv"
+
+
+def translate_pdf(input_path: str, output_path: str, source_lang: str, target_lang: str, job_id: str = None):
+    """Translate a PDF preserving formatting, images, and layout."""
+    doc = fitz.open(input_path)
+
+    # Phase 1: Extract all translatable spans from all pages
+    all_spans = []  # list of (page_num, span_info_dict)
     for page_num in range(len(doc)):
         page = doc[page_num]
         blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)["blocks"]
@@ -97,102 +133,88 @@ def count_translatable_spans(doc):
             for line in block["lines"]:
                 for span in line["spans"]:
                     if span["text"].strip():
-                        total += 1
-    return total
+                        all_spans.append((page_num, span))
 
+    total_spans = len(all_spans)
+    if total_spans == 0:
+        doc.save(output_path, garbage=4, deflate=True)
+        doc.close()
+        return
 
-def translate_pdf(input_path: str, output_path: str, source_lang: str, target_lang: str, job_id: str = None):
-    """Translate a PDF preserving formatting, images, and layout."""
-    doc = fitz.open(input_path)
+    # Phase 2: Batch translate all texts at once
+    all_texts = [span["text"] for _, span in all_spans]
 
-    # Count total spans for progress
-    total_spans = count_translatable_spans(doc)
-    processed_spans = 0
+    if job_id:
+        translation_jobs[job_id]["progress"] = 5
+        translation_jobs[job_id]["eta_seconds"] = -1
+
     start_time = time.time()
+    translated_texts = translate_batch(all_texts, source_lang, target_lang)
 
-    for page_num in range(len(doc)):
+    if job_id:
+        translation_jobs[job_id]["progress"] = 70
+
+    # Phase 3: Apply changes to PDF (redact + insert) page by page
+    # Group spans by page for batch redaction
+    page_changes = defaultdict(list)
+
+    for i, ((page_num, span), translated_text) in enumerate(zip(all_spans, translated_texts)):
+        original_text = span["text"]
+        if translated_text and translated_text != original_text:
+            page_changes[page_num].append((span, translated_text))
+
+    pages_done = 0
+    total_pages_with_changes = len(page_changes)
+
+    for page_num, changes in page_changes.items():
         page = doc[page_num]
-        blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)["blocks"]
 
-        for block in blocks:
-            if block["type"] != 0:  # Skip non-text blocks (images, etc.)
-                continue
+        # Batch: add all redact annotations first
+        for span, _ in changes:
+            rect = fitz.Rect(span["bbox"])
+            annot = page.add_redact_annot(rect)
+            annot.set_colors(fill=(1, 1, 1))
 
-            for line in block["lines"]:
-                for span in line["spans"]:
-                    original_text = span["text"]
-                    if not original_text.strip():
-                        continue
+        # Apply all redactions at once (much faster than per-span)
+        page.apply_redactions()
 
-                    processed_spans += 1
+        # Insert all translated texts
+        for span, translated_text in changes:
+            rect = fitz.Rect(span["bbox"])
+            font_size = span["size"]
+            font_color = span["color"]
+            pdf_font = get_pdf_font(span["font"])
 
-                    # Update progress
-                    if job_id and total_spans > 0:
-                        progress = int((processed_spans / total_spans) * 100)
-                        elapsed = time.time() - start_time
-                        if processed_spans > 0 and elapsed > 0:
-                            rate = processed_spans / elapsed
-                            remaining = (total_spans - processed_spans) / rate
-                            eta_seconds = int(remaining)
-                        else:
-                            eta_seconds = -1
-                        translation_jobs[job_id]["progress"] = progress
-                        translation_jobs[job_id]["eta_seconds"] = eta_seconds
+            r = ((font_color >> 16) & 0xFF) / 255.0
+            g = ((font_color >> 8) & 0xFF) / 255.0
+            b = (font_color & 0xFF) / 255.0
 
-                    translated_text = translate_text_chunked(
-                        original_text, source_lang, target_lang
-                    )
+            text_width = fitz.get_text_length(translated_text, fontname=pdf_font, fontsize=font_size)
+            available_width = rect.width
 
-                    if translated_text == original_text:
-                        continue
+            if text_width > 0 and available_width > 0:
+                adjusted_size = min(font_size, font_size * (available_width / text_width))
+                adjusted_size = max(adjusted_size, font_size * 0.5)
+            else:
+                adjusted_size = font_size
 
-                    # Get span properties
-                    rect = fitz.Rect(span["bbox"])
-                    font_size = span["size"]
-                    font_color = span["color"]
-                    font_flags = span["flags"]
+            text_point = fitz.Point(rect.x0, rect.y1 - (rect.height - adjusted_size) / 2)
+            page.insert_text(
+                text_point,
+                translated_text,
+                fontname=pdf_font,
+                fontsize=adjusted_size,
+                color=(r, g, b),
+            )
 
-                    # Determine font name
-                    font_name = span["font"]
-                    # Map to a base font that supports most characters
-                    if "bold" in font_name.lower() and "italic" in font_name.lower():
-                        pdf_font = "hebi"  # Helvetica Bold Italic
-                    elif "bold" in font_name.lower():
-                        pdf_font = "hebo"  # Helvetica Bold
-                    elif "italic" in font_name.lower():
-                        pdf_font = "heit"  # Helvetica Italic
-                    else:
-                        pdf_font = "helv"  # Helvetica
-
-                    # Convert integer color to RGB tuple
-                    r = ((font_color >> 16) & 0xFF) / 255.0
-                    g = ((font_color >> 8) & 0xFF) / 255.0
-                    b = (font_color & 0xFF) / 255.0
-
-                    # Redact original text (white out the area)
-                    annot = page.add_redact_annot(rect)
-                    annot.set_colors(fill=(1, 1, 1))  # White fill
-                    page.apply_redactions()
-
-                    # Calculate font size to fit text in the same area
-                    text_width = fitz.get_text_length(translated_text, fontname=pdf_font, fontsize=font_size)
-                    available_width = rect.width
-
-                    if text_width > 0 and available_width > 0:
-                        adjusted_size = min(font_size, font_size * (available_width / text_width))
-                        adjusted_size = max(adjusted_size, font_size * 0.5)  # Don't go below 50% of original
-                    else:
-                        adjusted_size = font_size
-
-                    # Insert translated text
-                    text_point = fitz.Point(rect.x0, rect.y1 - (rect.height - adjusted_size) / 2)
-                    page.insert_text(
-                        text_point,
-                        translated_text,
-                        fontname=pdf_font,
-                        fontsize=adjusted_size,
-                        color=(r, g, b),
-                    )
+        pages_done += 1
+        if job_id and total_pages_with_changes > 0:
+            pdf_progress = int((pages_done / total_pages_with_changes) * 30)
+            translation_jobs[job_id]["progress"] = 70 + pdf_progress
+            elapsed = time.time() - start_time
+            if elapsed > 0:
+                total_estimated = elapsed / (0.7 + pdf_progress / 100)
+                translation_jobs[job_id]["eta_seconds"] = max(0, int(total_estimated - elapsed))
 
     doc.save(output_path, garbage=4, deflate=True)
     doc.close()
@@ -314,7 +336,6 @@ def progress(job_id):
 
 def jsonify_str(data):
     """Convert dict to JSON string."""
-    import json
     return json.dumps(data)
 
 
